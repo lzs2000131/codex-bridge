@@ -79,9 +79,11 @@ requires_openai_auth = true
 Codex 인증 키 설정:
 
 ```bash
-# ~/.codex/auth.json (또는 cc-switch 프로필)
+# ~/.codex/auth.json
 { "OPENAI_API_KEY": "<.env의 PROXY_AUTH_KEY와 동일>" }
 ```
+
+> **[CC Switch](https://github.com/farion1231/cc-switch) 사용 중이신가요?** 수동 편집 대신 GUI에서 공급자를 추가하세요. [CC Switch와 함께 사용하기](#cc-switch와-함께-사용하기) 참조.
 
 `codex` 실행 — 완료.
 
@@ -192,6 +194,47 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 다른 모델 테스트
 
 엔드포인트, 입력 형태, 인증 게이트, 스트리밍 완료, effort 변환, 도구 호출 라운드트립, 공급자 잠금을 포함한 30개 항목 검사.
 
+## CC Switch와 함께 사용하기
+
+[CC Switch](https://github.com/farion1231/cc-switch)는 여러 AI CLI 도구(Claude Code, Codex, Gemini CLI 등)의 공급자 설정을 원클릭으로 관리·전환하는 인기 데스크톱 앱입니다.
+
+### 설정
+
+1. CC Switch 열기 → **Codex** 탭 → **공급자 추가**
+2. 공급자 정보 입력:
+
+   | 필드 | 값 |
+   |---|---|
+   | 이름 | `codex-bridge` (원하는 라벨) |
+   | API Key | `.env`의 `PROXY_AUTH_KEY` |
+   | Base URL | `http://127.0.0.1:4000/v1` |
+
+3. **활성화** 클릭 — CC Switch가 `~/.codex/auth.json` 작성 및 `config.toml` 업데이트를 자동 수행합니다.
+
+### 다중 공급자 전환
+
+여러 업스트림 키(예: DeepSeek용, MiMo용)가 있는 경우, `.env`의 `PROXY_KEYS`로 공급자별 인바운드 키를 생성합니다:
+
+```bash
+PROXY_KEYS=sk-deepseek-aaa:deepseek,sk-mimo-bbb:mimo,sk-all-ccc:*
+```
+
+각 키에 대해 CC Switch 프로필을 만들면, 프로필 전환으로 codex-bridge의 라우팅 대상이 바뀝니다.
+
+### CLI 대안
+
+터미널을 선호한다면 [cc-switch-cli](https://github.com/SaladDay/cc-switch-cli)로 GUI 없이 프로필을 전환할 수 있습니다:
+
+```bash
+# 프로필 목록
+cc-switch list
+
+# codex-bridge 프로필로 전환
+cc-switch use codex-bridge
+```
+
+> **팁:** 프로필 전환 후 터미널을 재시작하거나 새 셸에서 `codex`를 실행해야 새 인증이 적용됩니다.
+
 ## Advanced Usage
 
 - **Node 18–19 시작** — `--env-file`은 Node 20에서 추가됨. 이전 버전에서는:
@@ -204,6 +247,16 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 다른 모델 테스트
   ```
 - **다중 키 공급자 잠금** — 각 인바운드 키를 특정 공급자에 고정. 다중 프로파일 설정용. `PROXY_KEYS` 형식은 `env.example` 참조.
 - **모델 카탈로그 단일 출처** — `MODEL_CATALOG_PATH`를 Codex의 `model_catalog_json`과 동일 JSON에 가리켜 모델 목록 자동 동기화.
+
+## 문제 해결
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| `EADDRINUSE :4000` | 포트 사용 중 | `lsof -ti:4000 \| xargs kill` 또는 `.env`에서 `PROXY_PORT` 변경 |
+| `401 Unauthorized` | 인증 키 불일치 | `~/.codex/auth.json`의 `OPENAI_API_KEY`가 `.env`의 `PROXY_AUTH_KEY`와 일치하는지 확인 |
+| `--env-file: not recognized` | Node.js < 20 | `set -a && source .env && set +a && node proxy.mjs` 사용 |
+| 업스트림 타임아웃 | 공급자 응답 지연 | `.env`에서 `UPSTREAM_TIMEOUT_MS` 증가 (기본 120 000 ms) |
+| 모델을 찾을 수 없음 | `*_MODELS`에 미등록 | `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`에 추가하거나 `MODEL_CATALOG_PATH` 사용 |
 
 ## 요구사항
 

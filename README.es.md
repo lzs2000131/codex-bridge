@@ -80,9 +80,11 @@ requires_openai_auth = true
 Configura la clave de autenticación para Codex:
 
 ```bash
-# ~/.codex/auth.json (o vía perfil de cc-switch)
+# ~/.codex/auth.json
 { "OPENAI_API_KEY": "<misma PROXY_AUTH_KEY del .env>" }
 ```
+
+> **¿Usas [CC Switch](https://github.com/farion1231/cc-switch)?** Omite la edición manual — añade un proveedor desde la GUI. Ver [Uso con CC Switch](#uso-con-cc-switch).
 
 Ejecuta `codex` — listo.
 
@@ -193,6 +195,47 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # probar otro modelo
 
 Ejecuta 30 comprobaciones cubriendo endpoints, formas de entrada, puerta de auth, completado en streaming, traducción de effort, rondas de tool-call y bloqueo de proveedor.
 
+## Uso con CC Switch
+
+[CC Switch](https://github.com/farion1231/cc-switch) es una popular app de escritorio para gestionar y cambiar configuraciones de proveedores en múltiples herramientas CLI de IA (Claude Code, Codex, Gemini CLI, etc.) con un solo clic.
+
+### Configuración
+
+1. Abre CC Switch → pestaña **Codex** → **Añadir proveedor**
+2. Rellena la información del proveedor:
+
+   | Campo | Valor |
+   |---|---|
+   | Nombre | `codex-bridge` (o cualquier etiqueta) |
+   | API Key | Tu `PROXY_AUTH_KEY` del `.env` |
+   | Base URL | `http://127.0.0.1:4000/v1` |
+
+3. Haz clic en **Activar** — CC Switch escribe automáticamente en `~/.codex/auth.json` y actualiza `config.toml`.
+
+### Cambio multi-proveedor
+
+Si tienes múltiples claves upstream (ej. una para DeepSeek, otra para MiMo), usa `PROXY_KEYS` en `.env` para crear claves de entrada por proveedor:
+
+```bash
+PROXY_KEYS=sk-deepseek-aaa:deepseek,sk-mimo-bbb:mimo,sk-all-ccc:*
+```
+
+Luego crea un perfil de CC Switch para cada clave — al cambiar de perfil cambias a qué proveedor upstream enruta codex-bridge.
+
+### Alternativa por CLI
+
+Si prefieres la terminal, [cc-switch-cli](https://github.com/SaladDay/cc-switch-cli) ofrece el mismo cambio de perfiles sin GUI:
+
+```bash
+# Listar perfiles
+cc-switch list
+
+# Cambiar al perfil codex-bridge
+cc-switch use codex-bridge
+```
+
+> **Consejo:** Tras cambiar de perfil, reinicia tu terminal (o ejecuta `codex` en un nuevo shell) para que la nueva autenticación surta efecto.
+
 ## Uso avanzado
 
 - **Arranque en Node 18–19** — `--env-file` se añadió en Node 20. En versiones anteriores:
@@ -205,6 +248,16 @@ Ejecuta 30 comprobaciones cubriendo endpoints, formas de entrada, puerta de auth
   ```
 - **Bloqueo de proveedor multi-clave** — asigna cada clave entrante a un proveedor concreto para configuraciones multi-perfil. Formato `PROXY_KEYS` en `env.example`.
 - **Catálogo de modelos como fuente única** — apunta `MODEL_CATALOG_PATH` al mismo JSON que Codex usa (`model_catalog_json` en `config.toml`) para mantener las listas de modelos sincronizadas automáticamente.
+
+## Solución de problemas
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `EADDRINUSE :4000` | Puerto en uso | `lsof -ti:4000 \| xargs kill` o cambia `PROXY_PORT` en `.env` |
+| `401 Unauthorized` | Clave de auth no coincide | Verifica que `OPENAI_API_KEY` en `~/.codex/auth.json` coincide con `PROXY_AUTH_KEY` en `.env` |
+| `--env-file: not recognized` | Node.js < 20 | Usa `set -a && source .env && set +a && node proxy.mjs` |
+| Timeout upstream | Respuesta lenta del proveedor | Aumenta `UPSTREAM_TIMEOUT_MS` en `.env` (por defecto 120 000 ms) |
+| Modelo no encontrado | Modelo no está en `*_MODELS` | Añádelo a `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`, o usa `MODEL_CATALOG_PATH` |
 
 ## Requisitos
 

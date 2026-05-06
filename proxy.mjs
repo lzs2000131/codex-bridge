@@ -142,10 +142,10 @@ function loadCatalogModels(path) {
       }
       if (out[p]) out[p].push(m.slug);
     }
-    console.log(`[codex-proxy] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, openai=${out.openai.length})`);
+    console.log(`[codex-bridge] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, openai=${out.openai.length})`);
     return out;
   } catch (err) {
-    console.warn(`[codex-proxy] model_catalog: ${path} unreadable (${err.message}), falling back to env lists`);
+    console.warn(`[codex-bridge] model_catalog: ${path} unreadable (${err.message}), falling back to env lists`);
     return null;
   }
 }
@@ -1876,7 +1876,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
     sendJson(res, 200, {
       status: "ok",
-      proxy: "codex-proxy",
+      proxy: "codex-bridge",
       providers: [...enabledProviders],
       default_provider: getFallbackProvider(),
     });
@@ -2086,21 +2086,21 @@ server.headersTimeout = 300000;
 server.requestTimeout = 0;
 
 server.listen(PORT, () => {
-  console.log(`[codex-proxy] Listening on http://localhost:${PORT}`);
-  console.log(`[codex-proxy] Default provider: ${getFallbackProvider()}`);
+  console.log(`[codex-bridge] Listening on http://localhost:${PORT}`);
+  console.log(`[codex-bridge] Default provider: ${getFallbackProvider()}`);
   for (const [name, cfg] of Object.entries(OAI_COMPAT_PROVIDERS)) {
     const label = name.charAt(0).toUpperCase() + name.slice(1);
-    console.log(`[codex-proxy] ${label.padEnd(8)}: ${cfg.key ? `${cfg.base} | models=${cfg.models.join(", ")}` : "DISABLED"}`);
+    console.log(`[codex-bridge] ${label.padEnd(8)}: ${cfg.key ? `${cfg.base} | models=${cfg.models.join(", ")}` : "DISABLED"}`);
   }
-  console.log(`[codex-proxy] OpenAI  : ${OPENAI_KEY ? `${OPENAI_BASE} | models=${OPENAI_MODELS.join(", ")}` : "DISABLED"}`);
-  console.log(`[codex-proxy] GitHub  : ${process.env.GITHUB_TOKEN ? "authenticated (env)" : "lazy (will run `gh auth token` on first api.github.com fetch)"}`);
+  console.log(`[codex-bridge] OpenAI  : ${OPENAI_KEY ? `${OPENAI_BASE} | models=${OPENAI_MODELS.join(", ")}` : "DISABLED"}`);
+  console.log(`[codex-bridge] GitHub  : ${process.env.GITHUB_TOKEN ? "authenticated (env)" : "lazy (will run `gh auth token` on first api.github.com fetch)"}`);
   if (!PROXY_AUTH_ENABLED) {
-    console.log(`[codex-proxy] Inbound : OPEN — anyone on localhost can use this proxy (set PROXY_AUTH_KEY or PROXY_KEYS to lock down)`);
+    console.log(`[codex-bridge] Inbound : OPEN — anyone on localhost can use this proxy (set PROXY_AUTH_KEY or PROXY_KEYS to lock down)`);
   } else {
-    console.log(`[codex-proxy] Inbound : auth required (${PROXY_KEY_TABLE.size} key${PROXY_KEY_TABLE.size === 1 ? "" : "s"} loaded)`);
+    console.log(`[codex-bridge] Inbound : auth required (${PROXY_KEY_TABLE.size} key${PROXY_KEY_TABLE.size === 1 ? "" : "s"} loaded)`);
     for (const [key, lock] of PROXY_KEY_TABLE) {
       const lockLabel = lock === "*" ? "any provider" : `locked to ${lock}`;
-      console.log(`[codex-proxy]           ${key.slice(0, 16)}… (${key.length} chars) — ${lockLabel}`);
+      console.log(`[codex-bridge]           ${key.slice(0, 16)}… (${key.length} chars) — ${lockLabel}`);
     }
   }
 });

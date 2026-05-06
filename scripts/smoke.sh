@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# codex-proxy smoke test
+# codex-bridge smoke test
 # Usage: ./scripts/smoke.sh [base_url]
 #   defaults to http://localhost:4000
 #
@@ -115,7 +115,7 @@ get_status_noauth() {
   curl -sS -o /dev/null -w '%{http_code}' "$BASE$1"
 }
 
-echo "codex-proxy smoke @ $BASE (model=$MODEL, auth=$([[ -n "$AUTH_KEY" ]] && echo on || echo off))"
+echo "codex-bridge smoke @ $BASE (model=$MODEL, auth=$([[ -n "$AUTH_KEY" ]] && echo on || echo off))"
 echo
 
 echo "[1] endpoints"
@@ -141,7 +141,7 @@ echo "    req.destroyed=true post-body-read killed every SSE stream after one ch
 # Issue a real streaming request and check the SSE actually finishes. Curl will
 # exit 0 even for a half-closed stream, so we verify by counting the terminator
 # event in the captured body. We use --max-time so a hanging proxy fails fast.
-SSE_TMP="$(mktemp -t codex-proxy-sse.XXXXXX)"
+SSE_TMP="$(mktemp -t codex-bridge-sse.XXXXXX)"
 curl -sS -N --max-time 30 -X POST "$BASE/v1/responses" \
   -H 'Content-Type: application/json' \
   "${AUTH_HEADER[@]}" \
@@ -185,7 +185,7 @@ echo "    (b) cache miss with synthetic call_id -> safety-net forces thinking of
 # (a) Cache HIT: do a real round-1 turn so the proxy captures reasoning_content,
 #     then send round-2 with the SAME call_id and verify reasoning_tokens > 0
 #     (proves we replayed reasoning + DeepSeek kept thinking on).
-TOOL_RT_TMP="$(mktemp -t codex-proxy-rt.XXXXXX)"
+TOOL_RT_TMP="$(mktemp -t codex-bridge-rt.XXXXXX)"
 curl -sS --max-time 30 -X POST "$BASE/v1/responses" \
   -H 'Content-Type: application/json' \
   "${AUTH_HEADER[@]}" \

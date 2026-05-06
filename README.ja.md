@@ -79,9 +79,11 @@ requires_openai_auth = true
 Codex 用の認証キーを設定：
 
 ```bash
-# ~/.codex/auth.json (または cc-switch プロファイル経由)
+# ~/.codex/auth.json
 { "OPENAI_API_KEY": "<.env の PROXY_AUTH_KEY と同じ値>" }
 ```
+
+> **[CC Switch](https://github.com/farion1231/cc-switch) をお使いですか？** 手動編集の代わりに GUI でプロバイダーを追加できます。[CC Switch との連携](#cc-switch-との連携) を参照。
 
 `codex` を実行 — 完了。
 
@@ -192,6 +194,47 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 別モデルでテスト
 
 エンドポイント、入力形状、認証ゲート、ストリーミング完了、effort 変換、ツール呼び出しラウンドトリップ、プロバイダーロックを含む 30 項目をチェックします。
 
+## CC Switch との連携
+
+[CC Switch](https://github.com/farion1231/cc-switch) は、複数の AI CLI ツール（Claude Code、Codex、Gemini CLI など）のプロバイダー設定をワンクリックで管理・切り替えられる人気のデスクトップアプリです。
+
+### セットアップ
+
+1. CC Switch を開く → **Codex** タブ → **プロバイダーを追加**
+2. プロバイダー情報を入力：
+
+   | フィールド | 値 |
+   |---|---|
+   | 名前 | `codex-bridge`（任意のラベル） |
+   | API Key | `.env` の `PROXY_AUTH_KEY` |
+   | Base URL | `http://127.0.0.1:4000/v1` |
+
+3. **有効化** をクリック — CC Switch が `~/.codex/auth.json` への書き込みと `config.toml` の更新を自動で行います。
+
+### マルチプロバイダー切り替え
+
+複数の上流キー（例：DeepSeek 用と MiMo 用）がある場合、`.env` の `PROXY_KEYS` でプロバイダー別のインバウンドキーを作成します：
+
+```bash
+PROXY_KEYS=sk-deepseek-aaa:deepseek,sk-mimo-bbb:mimo,sk-all-ccc:*
+```
+
+キーごとに CC Switch のプロファイルを作成すれば、プロファイル切り替えで codex-bridge のルーティング先が変わります。
+
+### CLI での代替手段
+
+ターミナル派の方は [cc-switch-cli](https://github.com/SaladDay/cc-switch-cli) で GUI なしのプロファイル切り替えが可能です：
+
+```bash
+# プロファイル一覧
+cc-switch list
+
+# codex-bridge プロファイルに切り替え
+cc-switch use codex-bridge
+```
+
+> **ヒント：** プロファイル切り替え後、ターミナルを再起動（または新しいシェルで `codex` を実行）して認証を反映させてください。
+
 ## Advanced Usage
 
 - **Node 18–19 起動** — `--env-file` は Node 20 で追加されました。旧バージョンでは：
@@ -204,6 +247,16 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 別モデルでテスト
   ```
 - **マルチキーのプロバイダーロック** — 各インバウンドキーを特定プロバイダーに固定。マルチプロファイル構成向け。`PROXY_KEYS` の書式は `env.example` を参照。
 - **モデルカタログの単一情報源** — `MODEL_CATALOG_PATH` を Codex の `model_catalog_json` と同じ JSON に向け、モデル一覧を自動同期。
+
+## トラブルシューティング
+
+| 症状 | 原因 | 解決策 |
+|---|---|---|
+| `EADDRINUSE :4000` | ポートが使用中 | `lsof -ti:4000 \| xargs kill` または `.env` で `PROXY_PORT` を変更 |
+| `401 Unauthorized` | 認証キー不一致 | `~/.codex/auth.json` の `OPENAI_API_KEY` が `.env` の `PROXY_AUTH_KEY` と一致しているか確認 |
+| `--env-file: not recognized` | Node.js < 20 | `set -a && source .env && set +a && node proxy.mjs` を使用 |
+| 上流タイムアウト | プロバイダーの応答が遅い | `.env` の `UPSTREAM_TIMEOUT_MS` を増加（デフォルト 120 000 ms） |
+| モデルが見つからない | `*_MODELS` に未登録 | `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS` に追加、または `MODEL_CATALOG_PATH` を使用 |
 
 ## 動作要件
 

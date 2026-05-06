@@ -79,9 +79,11 @@ requires_openai_auth = true
 设置 Codex 鉴权密钥：
 
 ```bash
-# ~/.codex/auth.json（或通过 cc-switch 配置）
+# ~/.codex/auth.json
 { "OPENAI_API_KEY": "<同 .env 中的 PROXY_AUTH_KEY>" }
 ```
+
+> **使用 [CC Switch](https://github.com/farion1231/cc-switch)？** 无需手动编辑，直接在 GUI 中添加供应商即可。详见 [配合 CC Switch 使用](#配合-cc-switch-使用)。
 
 运行 `codex` —— 完成。
 
@@ -192,6 +194,47 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 测试不同模型
 
 执行 30 项检查，覆盖端点、入参形态、鉴权门、流式完成、思考强度翻译、工具调用回合与供应商锁定。
 
+## 配合 CC Switch 使用
+
+[CC Switch](https://github.com/farion1231/cc-switch) 是一款热门桌面应用，可一键管理和切换多种 AI CLI 工具（Claude Code、Codex、Gemini CLI 等）的供应商配置。
+
+### 设置
+
+1. 打开 CC Switch → **Codex** 选项卡 → **添加供应商**
+2. 填写供应商信息：
+
+   | 字段 | 值 |
+   |---|---|
+   | 名称 | `codex-bridge`（或你喜欢的标签） |
+   | API Key | `.env` 中的 `PROXY_AUTH_KEY` |
+   | Base URL | `http://127.0.0.1:4000/v1` |
+
+3. 点击 **启用** —— CC Switch 会自动写入 `~/.codex/auth.json` 并更新 `config.toml`。
+
+### 多供应商切换
+
+如果你有多个上游密钥（如 DeepSeek 一个、MiMo 一个），可在 `.env` 中使用 `PROXY_KEYS` 创建按供应商隔离的入站密钥：
+
+```bash
+PROXY_KEYS=sk-deepseek-aaa:deepseek,sk-mimo-bbb:mimo,sk-all-ccc:*
+```
+
+然后在 CC Switch 中为每个密钥创建独立配置 —— 切换配置即切换 codex-bridge 路由的上游供应商。
+
+### CLI 替代方案
+
+如果你更喜欢终端操作，[cc-switch-cli](https://github.com/SaladDay/cc-switch-cli) 提供无 GUI 的配置切换：
+
+```bash
+# 列出配置
+cc-switch list
+
+# 切换到 codex-bridge 配置
+cc-switch use codex-bridge
+```
+
+> **提示：** 切换配置后，请重启终端（或在新 shell 中运行 `codex`）使新鉴权生效。
+
 ## 进阶用法
 
 - **Node 18–19 启动** —— `--env-file` 在 Node 20 才引入。旧版本请使用：
@@ -204,6 +247,16 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 测试不同模型
   ```
 - **多密钥锁定供应商** —— 为每个入站密钥指定固定供应商，便于多配置场景。`PROXY_KEYS` 格式参见 `env.example`。
 - **模型清单单一来源** —— 将 `MODEL_CATALOG_PATH` 指向 Codex 使用的同一份 JSON（`config.toml` 中的 `model_catalog_json`），自动保持模型列表同步。
+
+## 常见问题
+
+| 症状 | 原因 | 解决方案 |
+|---|---|---|
+| `EADDRINUSE :4000` | 端口被占用 | `lsof -ti:4000 \| xargs kill` 或在 `.env` 中更改 `PROXY_PORT` |
+| `401 Unauthorized` | 鉴权密钥不匹配 | 确认 `~/.codex/auth.json` 中的 `OPENAI_API_KEY` 与 `.env` 中的 `PROXY_AUTH_KEY` 一致 |
+| `--env-file: not recognized` | Node.js 版本 < 20 | 使用 `set -a && source .env && set +a && node proxy.mjs` |
+| 上游超时 | 供应商响应慢 | 在 `.env` 中增大 `UPSTREAM_TIMEOUT_MS`（默认 120 000 ms） |
+| 模型未找到 | 模型不在 `*_MODELS` 列表中 | 添加到 `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`，或使用 `MODEL_CATALOG_PATH` |
 
 ## 环境要求
 
