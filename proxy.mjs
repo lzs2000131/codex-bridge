@@ -1483,6 +1483,16 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
   for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
     const loopReq = { ...baseRequest, messages: loopMessages, stream: false };
+    // From loop 1 onward, loopMessages contains the synthetic assistant
+    // tool_call messages we inject for each web_fetch (see end of loop) — and
+    // those carry no reasoning_content. DeepSeek/MiMo thinking mode rejects a
+    // reasoning-less assistant tool_call ("The reasoning_content in the thinking
+    // mode must be passed back to the API."), so force thinking off for the rest
+    // of the loop. Both callers of runWebFetchLoop are deepseek/mimo.
+    if (loop > 0) {
+      loopReq.thinking = { type: "disabled" };
+      delete loopReq.reasoning_effort;
+    }
     const upstreamRes = await fetchWithTimeout(upstreamUrl, {
       method: "POST",
       headers: {
