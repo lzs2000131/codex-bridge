@@ -194,6 +194,26 @@ const STORE_MAX = Number(process.env.STORE_MAX) || 500;
 const MAX_CONSECUTIVE_TOOL_CALLS = Number(process.env.MAX_CONSECUTIVE_TOOL_CALLS) || 20; // circuit breaker threshold
 const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS) || 120000; // 2 min, applies to upstream chat/completions/responses calls
 
+// Synthetic summarization prompt for the /responses/compact endpoint. Codex's
+// remote compaction normally relies on OpenAI injecting this server-side; our
+// upstreams (DeepSeek/MiMo) won't, so we replace the agent system prompt with a
+// summarizer directive, append the request below, and return the model's prose
+// as a single compacted assistant message (see handleResponsesCompact).
+//
+// The system-level directive is critical: without it the model keeps the
+// original "coding agent" instructions and just continues the task (even
+// emitting tool calls) instead of summarizing.
+const COMPACT_SUMMARY_INSTRUCTIONS =
+  "You are a conversation summarizer. Your ONLY task is to read the conversation and write a summary of it. " +
+  "Do NOT act as a coding agent. Do NOT call any tools or functions. Do NOT continue, resume, or perform any task " +
+  "described in the conversation — only describe what happened. Output plain text only.";
+const COMPACT_SUMMARY_PROMPT =
+  "Summarize the entire conversation above to preserve everything needed to continue the work later. " +
+  "Capture: the user's goals and constraints; key decisions and their rationale; files, commands, APIs and identifiers " +
+  "touched and their current state; what has been completed; what remains and the planned next steps; and any open " +
+  "questions, blockers, or important findings. Preserve concrete details (file paths, function names, error messages, " +
+  "values) verbatim — do not generalize them away. Respond with ONLY the summary text: no preamble, no sign-off, no questions.";
+
 // --- Proxy-side web_fetch tool (bypasses sandbox restrictions) ---
 
 const WEB_FETCH_TOOL = {
@@ -1707,6 +1727,57 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   sendJson(res, 200, responsesResponse);
 }
 
+// Codex remote-compaction endpoint (/responses/compact). Unlike /responses this
+// is UNARY: Codex parses the entire response body as one JSON object shaped
+// `{ output: [ResponseItem, ...] }` (codex `CompactHistoryResponse`) and keeps
+// the assistant message(s) as the new compacted history — it is NOT an SSE
+// stream. Our upstreams have no compaction endpoint, so the dispatch already
+// injected a summarizer prompt + request and stripped tools; here we make a
+// single non-streaming chat/completions call and wrap the prose as one assistant
+// message. (web_fetch is deliberately bypassed — we want a summary, not fetches.)
+async function handleResponsesCompact(req, provider, body, res) {
+  const cfg = OAI_COMPAT_PROVIDERS[provider];
+  if (!cfg || !cfg.key) {
+    sendJson(res, 400, {
+      error: { message: `Compaction is only supported for chat-completions providers; "${provider}" is not configured` },
+    });
+    return;
+  }
+
+  maybeResolvePreviousResponseChain(body, provider);
+
+  const chatReq = responsesRequestToChatCompletions(body, provider);
+  const requested = normalizeModelId(chatReq.model);
+  const isProviderModel = cfg.models.some((m) => normalizeModelId(m) === requested);
+  chatReq.model = isProviderModel ? chatReq.model : cfg.defaultModel;
+  chatReq.stream = false;
+  delete chatReq.tools; // prose summary, never a tool call
+  delete chatReq.tool_choice;
+
+  log.info(`[proxy] compact ${provider}(${chatReq.model}) | messages=${chatReq.messages.length}`);
+
+  const upstreamRes = await fetchWithTimeout(`${cfg.base}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.key}` },
+    body: JSON.stringify(chatReq),
+  });
+  if (!upstreamRes.ok) {
+    await sendUpstreamError(upstreamRes, res);
+    return;
+  }
+
+  const cc = await upstreamRes.json();
+  let text = cc?.choices?.[0]?.message?.content;
+  if (typeof text !== "string") text = "";
+  text = text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim(); // mirror chatCompletionToResponse
+
+  // Single JSON object, no SSE. `output` items must be ResponseItem-shaped;
+  // a plain assistant message is kept by codex's should_keep_compacted_history_item.
+  sendJson(res, 200, {
+    output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+  });
+}
+
 async function handleOaiCompatChatCompletions(req, provider, body, res) {
   const cfg = OAI_COMPAT_PROVIDERS[provider];
   if (!cfg || !cfg.key) {
@@ -1907,13 +1978,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && (req.url === "/v1/responses" || req.url === "/responses")) {
+  const isCompactPath =
+    req.url === "/responses/compact" ||
+    req.url === "/v1/responses/compact" ||
+    req.url === "/backend-api/codex/responses/compact";
+  if (req.method === "POST" && (req.url === "/v1/responses" || req.url === "/responses" || isCompactPath)) {
     const body = await readJsonBody(req, res);
     if (!body) return;
 
+    // Codex's remote-compaction endpoint (/responses/compact). It is UNARY: Codex
+    // parses the whole response body as one JSON object { output: [ResponseItem...] }
+    // and keeps assistant messages as the new compacted history — NOT an SSE
+    // stream (returning SSE fails with "stream disconnected before completion:
+    // expected value at line 1 column 1"). OpenAI injects the summarization prompt
+    // server-side; DeepSeek/MiMo won't, so we synthesize it here (swap the agent
+    // persona for a summarizer directive, append an explicit summarize request,
+    // drop the tool catalog) and hand off to handleResponsesCompact below.
+    if (isCompactPath) {
+      body.input = [
+        ...normalizeInputToArray(body.input),
+        { type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_SUMMARY_PROMPT }] },
+      ];
+      body.instructions = COMPACT_SUMMARY_INSTRUCTIONS; // replace the agent persona with a summarizer one
+      body.reasoning = { effort: "low" }; // summarizing needs no deep reasoning; keep it fast
+      body.stream = false; // unary endpoint, handler returns a single JSON object
+      delete body.tools;
+      delete body.tool_choice;
+      delete body.prompt_cache_key;
+    }
+
     if (process.env.ACCESS_LOG !== "0") {
       const inputType = Array.isArray(body.input) ? `array(${body.input.length})` : typeof body.input;
-      log.access(`[access] /v1/responses body keys=${Object.keys(body).join(",")} model=${body.model || "<none>"} input=${inputType} stream=${!!body.stream}`);
+      log.access(`[access] ${isCompactPath ? "compact " : ""}/v1/responses body keys=${Object.keys(body).join(",")} model=${body.model || "<none>"} input=${inputType} stream=${!!body.stream}`);
     }
 
     try {
@@ -1986,6 +2082,11 @@ const server = http.createServer(async (req, res) => {
           },
           incomplete_details: null,
         });
+        return;
+      }
+
+      if (isCompactPath) {
+        await handleResponsesCompact(req, provider, body, res);
         return;
       }
 
