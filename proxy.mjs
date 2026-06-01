@@ -743,38 +743,13 @@ function responsesRequestToChatCompletions(body, provider) {
     flushPendingToolCalls();
   }
 
-  const merged = normalizeMessages(messages);
-
-  const TOOL_OUTPUT_MAX = 2000;
-  const KEEP_RECENT_FULL = 10;
-  for (let i = 0; i < Math.max(0, merged.length - KEEP_RECENT_FULL); i++) {
-    const msg = merged[i];
-    if (msg.role === "tool" && typeof msg.content === "string" && msg.content.length > TOOL_OUTPUT_MAX) {
-      msg.content = msg.content.slice(0, TOOL_OUTPUT_MAX) + "\n...[output truncated, " + (msg.content.length - TOOL_OUTPUT_MAX) + " chars removed]";
-    }
-  }
-
-  const MAX_MESSAGES = 55;
-  let finalMessages = merged;
-  if (merged.length > MAX_MESSAGES) {
-    const head = merged.slice(0, 2);
-    let tail = merged.slice(-(MAX_MESSAGES - 3));
-    while (tail.length > 0 && tail[0].role === "tool") tail.shift();
-    finalMessages = [
-      ...head,
-      {
-        role: "user",
-        content: "[Earlier conversation trimmed. Do not repeat previous statements or tool calls you already made. Continue with the current task. If you have enough information, respond to the user instead of making more tool calls.]",
-      },
-      ...tail,
-    ];
-    log.info(`[proxy] trimmed ${merged.length} -> ${finalMessages.length} messages`);
-  }
-
-  // After trim we may have left orphan tool messages — re-normalise to drop them.
-  if (merged.length > MAX_MESSAGES) {
-    finalMessages = normalizeMessages(finalMessages);
-  }
+  // Faithful translation only: normalizeMessages handles protocol-correctness
+  // (re-order tool replies after their tool_calls, merge same-role runs, drop
+  // orphan tool messages). We do NOT trim history or truncate tool outputs here
+  // — context management is Codex's job (it self-compacts to its own window
+  // before sending), and any lossy trim on our side silently corrupts long
+  // conversations and Codex's own compaction requests.
+  const finalMessages = normalizeMessages(messages);
 
   const req = {
     model: body.model,
