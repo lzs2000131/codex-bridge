@@ -187,10 +187,28 @@ const modelCatalog = [
 ];
 
 // --- Response store for previous_response_id bridging ---
+//
+// The store holds per-response conversation slices keyed by response id, so a
+// later turn carrying `previous_response_id` can be stitched back into a full
+// history (incl. across provider boundaries). Two backends share one async
+// interface (get/set/del/touch/getReasoningByCallIds/close):
+//
+//   MemoryStore — default. In-process LRU Map, capped at STORE_MAX, TTL-swept on
+//                 write. Lost on restart, single-instance only. Zero deps.
+//   RedisStore  — opt-in via REDIS_URL. Survives restarts and is shared across
+//                 replicas (horizontal scaling). Uses the official `redis` pkg,
+//                 loaded lazily so the default path stays dependency-free.
+//
+// `store` defaults to MemoryStore synchronously; initStore() may swap in a
+// RedisStore at startup (see bottom of file). All call sites await the store.
 
-const responseStore = new Map();
 const STORE_TTL = Number(process.env.STORE_TTL_MS) || 60 * 60 * 1000; // 1 hour
 const STORE_MAX = Number(process.env.STORE_MAX) || 500;
+const REDIS_URL = (process.env.REDIS_URL || "").trim(); // empty = in-memory store
+let DEBUG_REQ_SEQ = 0; // monotonic counter for debug body-dump filenames
+// Block Codex Desktop's background "hyperpersonalized suggestions" agent (see
+// isCodexSuggestionsRequest). On by default — set to "0" to let it through.
+const BLOCK_CODEX_SUGGESTIONS = process.env.BLOCK_CODEX_SUGGESTIONS !== "0";
 const MAX_CONSECUTIVE_TOOL_CALLS = Number(process.env.MAX_CONSECUTIVE_TOOL_CALLS) || 20; // circuit breaker threshold
 const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS) || 120000; // 2 min, applies to upstream chat/completions/responses calls
 
@@ -414,32 +432,132 @@ function resolveProviderForModel(model) {
   return getFallbackProvider();
 }
 
-// Read with LRU bookkeeping: refreshes insertion order so frequently-used roots
-// don't get evicted by the eviction loop in storeResponse.
-function touchResponse(id) {
-  if (!id) return undefined;
-  const entry = responseStore.get(id);
-  if (!entry) return undefined;
-  // Re-insert to move it to the most-recently-used end of the Map.
-  responseStore.delete(id);
-  responseStore.set(id, entry);
-  return entry;
+// Collect the reasoning_content stashed on a stored entry, keyed by the call_id
+// of each function_call it produced. DeepSeek emits one reasoning per response,
+// shared by all tool_calls in that turn — so every call_id maps to the same text.
+function reasoningCallIdsFromEntry(entry) {
+  const out = [];
+  if (!entry || !entry.reasoningContent || !Array.isArray(entry.output)) return out;
+  for (const o of entry.output) {
+    if (o.type === "function_call" && o.call_id) out.push(o.call_id);
+  }
+  return out;
 }
 
-function storeResponse(id, data) {
-  if (!id) return;
+// --- MemoryStore: in-process LRU Map (default backend) ---
+class MemoryStore {
+  constructor() { this.map = new Map(); }
 
-  if (responseStore.size >= STORE_MAX) {
-    const now = Date.now();
-    for (const [key, val] of responseStore) {
-      if (now - val.storedAt > STORE_TTL) responseStore.delete(key);
+  // Read with LRU bookkeeping: refreshes insertion order so frequently-used roots
+  // don't get evicted by the eviction loop in put().
+  async touch(id) {
+    if (!id) return undefined;
+    const entry = this.map.get(id);
+    if (!entry) return undefined;
+    this.map.delete(id);
+    this.map.set(id, entry);
+    return entry;
+  }
+
+  async get(id) { return id ? this.map.get(id) : undefined; }
+
+  async del(id) { if (id) this.map.delete(id); }
+
+  async put(id, entry) {
+    if (this.map.size >= STORE_MAX) {
+      const now = Date.now();
+      for (const [key, val] of this.map) {
+        if (now - val.storedAt > STORE_TTL) this.map.delete(key);
+      }
+      if (this.map.size >= STORE_MAX) {
+        // Insertion order = LRU order because every read goes through touch().
+        const oldest = this.map.keys().next().value;
+        this.map.delete(oldest);
+      }
     }
-    if (responseStore.size >= STORE_MAX) {
-      // Insertion order = LRU order because every read goes through touchResponse.
-      const oldest = responseStore.keys().next().value;
-      responseStore.delete(oldest);
+    this.map.set(id, entry);
+  }
+
+  get size() { return this.map.size; }
+
+  async getReasoningByCallIds(callIds) {
+    const want = new Set(callIds);
+    const result = new Map();
+    if (want.size === 0) return result;
+    for (const entry of this.map.values()) {
+      for (const cid of reasoningCallIdsFromEntry(entry)) {
+        if (want.has(cid)) result.set(cid, entry.reasoningContent);
+      }
+    }
+    return result;
+  }
+
+  async close() {}
+}
+
+// --- RedisStore: shared, persistent backend (opt-in via REDIS_URL) ---
+//
+// resp:{id}    -> JSON entry, EX = STORE_TTL seconds (touch() refreshes the TTL)
+// reason:{cid} -> reasoning_content for a function_call, EX = STORE_TTL seconds
+// Eviction is delegated to TTL + the Redis server's maxmemory policy, so
+// STORE_MAX does not apply here.
+class RedisStore {
+  constructor(client) {
+    this.client = client;
+    this.ttlSec = Math.max(1, Math.round(STORE_TTL / 1000));
+  }
+
+  async touch(id) {
+    if (!id) return undefined;
+    const raw = await this.client.get(`resp:${id}`);
+    if (!raw) return undefined;
+    await this.client.expire(`resp:${id}`, this.ttlSec);
+    return JSON.parse(raw);
+  }
+
+  async get(id) {
+    if (!id) return undefined;
+    const raw = await this.client.get(`resp:${id}`);
+    return raw ? JSON.parse(raw) : undefined;
+  }
+
+  async del(id) { if (id) await this.client.del(`resp:${id}`); }
+
+  async put(id, entry) {
+    await this.client.set(`resp:${id}`, JSON.stringify(entry), { EX: this.ttlSec });
+    const cids = reasoningCallIdsFromEntry(entry);
+    if (cids.length) {
+      const pipe = this.client.multi();
+      for (const cid of cids) pipe.set(`reason:${cid}`, entry.reasoningContent, { EX: this.ttlSec });
+      await pipe.exec();
     }
   }
+
+  async getReasoningByCallIds(callIds) {
+    const result = new Map();
+    const ids = [...new Set(callIds)];
+    if (ids.length === 0) return result;
+    const vals = await this.client.mGet(ids.map((c) => `reason:${c}`));
+    ids.forEach((cid, i) => { if (vals[i] != null) result.set(cid, vals[i]); });
+    return result;
+  }
+
+  async close() {
+    try { await this.client.quit(); } catch { /* already closing */ }
+  }
+}
+
+// Default to the zero-dependency in-memory backend; initStore() (bottom of file)
+// may replace this with a RedisStore when REDIS_URL is configured.
+let store = new MemoryStore();
+
+// Read with LRU bookkeeping. Returns the stored entry (or undefined).
+async function touchResponse(id) {
+  return store.touch(id);
+}
+
+async function storeResponse(id, data) {
+  if (!id) return;
 
   const isToolCallOnly = Array.isArray(data.output) &&
     data.output.length > 0 &&
@@ -447,7 +565,7 @@ function storeResponse(id, data) {
 
   let consecutiveToolCalls = 0;
   if (data.previousResponseId) {
-    const prev = touchResponse(data.previousResponseId);
+    const prev = await store.touch(data.previousResponseId);
     if (prev?.breakerFired) {
       // Hard breaker already fired up-chain — counter has been reset; don't propagate.
       consecutiveToolCalls = 0;
@@ -456,20 +574,20 @@ function storeResponse(id, data) {
     }
   }
 
-  responseStore.set(id, { ...data, storedAt: Date.now(), consecutiveToolCalls });
+  await store.put(id, { ...data, storedAt: Date.now(), consecutiveToolCalls });
   log.info(
-    `[proxy] stored response ${id} (provider=${data.provider || "unknown"}, store size: ${responseStore.size}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
+    `[proxy] stored response ${id} (provider=${data.provider || "unknown"}${store.size !== undefined ? `, store size: ${store.size}` : ""}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
   );
 }
 
-function resolveResponseChain(previousResponseId) {
+async function resolveResponseChain(previousResponseId) {
   const chain = [];
   let currentId = previousResponseId;
   const visited = new Set();
 
   while (currentId && !visited.has(currentId)) {
     visited.add(currentId);
-    const stored = touchResponse(currentId);
+    const stored = await touchResponse(currentId);
     if (!stored) {
       log.warn(`[proxy] previous_response_id ${currentId} not found in store`);
       break;
@@ -494,10 +612,10 @@ function normalizeInputToArray(input) {
   return [];
 }
 
-function maybeResolvePreviousResponseChain(body, targetProvider) {
+async function maybeResolvePreviousResponseChain(body, targetProvider) {
   if (!body.previous_response_id) return;
 
-  const previous = responseStore.get(body.previous_response_id);
+  const previous = await store.get(body.previous_response_id);
   if (!previous) {
     if (targetProvider === "deepseek") {
       log.warn(`[proxy] previous_response_id ${body.previous_response_id} missing; DeepSeek request will continue without restored history`);
@@ -508,13 +626,27 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
   const needsLocalResolution = targetProvider === "deepseek" || previous.provider !== targetProvider;
   if (!needsLocalResolution) return;
 
-  const chainItems = resolveResponseChain(body.previous_response_id);
+  const chainItems = await resolveResponseChain(body.previous_response_id);
   if (chainItems.length === 0) return;
 
   const currentInput = normalizeInputToArray(body.input);
   body.input = [...chainItems, ...currentInput];
   delete body.previous_response_id;
   log.info(`[proxy] locally resolved previous_response_id across provider boundary -> ${targetProvider} (${chainItems.length} items prepended)`);
+}
+
+// Detect Codex Desktop's background "hyperpersonalized suggestions" agent. It
+// POSTs to /v1/responses with a strict json_schema output contract whose
+// top-level `suggestions[]` items carry `appId` / `prompt` fields — a shape
+// unique to this feature. These requests auto-read the user's repo (git history,
+// AGENTS.md / CLAUDE.md, source) and ship it to whatever upstream the proxy
+// routes to (e.g. DeepSeek), so operators may want to block them. Matching on
+// the output schema is far more robust than sniffing the prompt text.
+function isCodexSuggestionsRequest(body) {
+  const suggestions = body?.text?.format?.schema?.properties?.suggestions;
+  if (!suggestions || suggestions.type !== "array") return false;
+  const itemProps = suggestions.items?.properties || {};
+  return "appId" in itemProps || "prompt" in itemProps;
 }
 
 // --- Shared message-list normalisation ---
@@ -671,7 +803,7 @@ function applyEffortTranslation(req, effort, provider) {
   req.reasoning_effort = e;
 }
 
-function responsesRequestToChatCompletions(body, provider) {
+async function responsesRequestToChatCompletions(body, provider) {
   const messages = [];
 
   if (body.instructions) {
@@ -681,22 +813,23 @@ function responsesRequestToChatCompletions(body, provider) {
     });
   }
 
-  // Build a callId -> reasoning_content map from responseStore. We capture
-  // upstream `delta.reasoning_content` on each turn and stash it on the stored
-  // entry; here we replay it so DeepSeek's thinking-mode tool-call round-trip
-  // doesn't 400 on a missing `reasoning_content`. Scanning all entries is fine
-  // because the store is hard-capped (STORE_MAX, default 500). Only build the
-  // index for DeepSeek — MiMo / OpenAI don't accept reasoning_content fields.
-  const reasoningByCallId = new Map();
-  if (provider === "deepseek") {
-    for (const entry of responseStore.values()) {
-      if (!entry.reasoningContent) continue;
-      for (const out of entry.output || []) {
-        if (out.type === "function_call" && out.call_id) {
-          reasoningByCallId.set(out.call_id, entry.reasoningContent);
-        }
+  // Build a callId -> reasoning_content map. We capture upstream
+  // `delta.reasoning_content` on each turn and stash it on the stored entry;
+  // here we replay it so DeepSeek's thinking-mode tool-call round-trip doesn't
+  // 400 on a missing `reasoning_content`. We only need reasoning for the
+  // function_call ids actually referenced in this request's input, so pre-scan
+  // body.input for those call_ids and fetch just them from the store (O(calls),
+  // and Redis-friendly — no full-store scan). Only for DeepSeek; MiMo / OpenAI
+  // don't accept reasoning_content fields.
+  let reasoningByCallId = new Map();
+  if (provider === "deepseek" && Array.isArray(body.input)) {
+    const callIds = [];
+    for (const item of body.input) {
+      if ((item.type === "function_call" || item.type === "function_call_output") && item.call_id) {
+        callIds.push(item.call_id);
       }
     }
+    if (callIds.length) reasoningByCallId = await store.getReasoningByCallIds(callIds);
   }
 
   if (typeof body.input === "string") {
@@ -1335,6 +1468,11 @@ async function pipeResponsesStreamAndCapture(req, upstreamRes, res, onCompleted)
   const teardown = wireClientCancel(res, upstreamRes);
   let buffer = "";
   const decoder = new TextDecoder();
+  // Capture the completed payload and persist it after the stream drains. The
+  // store write is async (Redis backend), so we must await it before res.end()
+  // — otherwise the client could issue its follow-up request (carrying this
+  // response id as previous_response_id) before the write lands.
+  let completedPayload = null;
 
   const handleBlock = (block) => {
     const lines = block.split("\n");
@@ -1352,7 +1490,7 @@ async function pipeResponsesStreamAndCapture(req, upstreamRes, res, onCompleted)
     try {
       const parsed = JSON.parse(data);
       if (eventType === "response.completed" || parsed.type === "response.completed") {
-        onCompleted(parsed.response || parsed);
+        completedPayload = parsed.response || parsed;
       }
     } catch {
       // Ignore parse failures in streamed event capture; stream still passes through.
@@ -1374,6 +1512,7 @@ async function pipeResponsesStreamAndCapture(req, upstreamRes, res, onCompleted)
     }
 
     if (buffer.trim()) handleBlock(buffer);
+    if (completedPayload) await onCompleted(completedPayload);
   } finally {
     teardown();
   }
@@ -1407,9 +1546,9 @@ async function forwardOpenAIResponses(req, body, res, originalInput, originalPre
   }
 
   if (body.stream) {
-    await pipeResponsesStreamAndCapture(req, upstreamRes, res, (completedResponse) => {
+    await pipeResponsesStreamAndCapture(req, upstreamRes, res, async (completedResponse) => {
       if (completedResponse?.id && Array.isArray(completedResponse.output)) {
-        storeResponse(completedResponse.id, {
+        await storeResponse(completedResponse.id, {
           provider: "openai",
           input: originalInput,
           output: completedResponse.output,
@@ -1422,7 +1561,7 @@ async function forwardOpenAIResponses(req, body, res, originalInput, originalPre
 
   const response = await upstreamRes.json();
   if (response?.id && Array.isArray(response.output)) {
-    storeResponse(response.id, {
+    await storeResponse(response.id, {
       provider: "openai",
       input: originalInput,
       output: response.output,
@@ -1596,10 +1735,10 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   }
 
   const originalPreviousResponseId = body.previous_response_id || null;
-  maybeResolvePreviousResponseChain(body, provider);
+  await maybeResolvePreviousResponseChain(body, provider);
 
   if (originalPreviousResponseId) {
-    const prevStored = touchResponse(originalPreviousResponseId);
+    const prevStored = await touchResponse(originalPreviousResponseId);
     const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
     if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS) {
       log.warn(`[proxy] CIRCUIT BREAKER: ${consecutiveTc} consecutive tool-call-only responses detected — injecting stop-loop nudge`);
@@ -1618,7 +1757,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     }
   }
 
-  const chatReq = responsesRequestToChatCompletions(body, provider);
+  const chatReq = await responsesRequestToChatCompletions(body, provider);
   // Honour the model the client asked for if it belongs to this provider; otherwise fall back to the
   // provider's first configured model. (Codex usually sends the configured `model` field already.)
   const requested = normalizeModelId(chatReq.model);
@@ -1632,7 +1771,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
 
   let hardBreakerFired = false;
   if (originalPreviousResponseId) {
-    const prevStored = touchResponse(originalPreviousResponseId);
+    const prevStored = await touchResponse(originalPreviousResponseId);
     const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
     if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS + 3) {
       log.warn("[proxy] HARD CIRCUIT BREAKER: stripping all tools to force text response");
@@ -1665,7 +1804,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       return;
     }
     const responsesResponse = chatCompletionToResponse(result.response, body.model, originalPreviousResponseId, body.metadata);
-    storeResponse(responsesResponse.id, {
+    await storeResponse(responsesResponse.id, {
       provider,
       input: originalInput,
       output: responsesResponse.output,
@@ -1702,7 +1841,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       originalPreviousResponseId,
       body.metadata
     );
-    storeResponse(streamRespId, {
+    await storeResponse(streamRespId, {
       provider,
       input: originalInput,
       output: streamOutput,
@@ -1716,7 +1855,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   const ccResponse = await upstreamRes.json();
   const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
   const nonStreamReasoning = ccResponse.choices?.[0]?.message?.reasoning_content || "";
-  storeResponse(responsesResponse.id, {
+  await storeResponse(responsesResponse.id, {
     provider,
     input: originalInput,
     output: responsesResponse.output,
@@ -1758,9 +1897,9 @@ async function handleResponsesCompact(req, provider, body, res) {
     return;
   }
 
-  maybeResolvePreviousResponseChain(body, provider);
+  await maybeResolvePreviousResponseChain(body, provider);
 
-  const chatReq = responsesRequestToChatCompletions(body, provider);
+  const chatReq = await responsesRequestToChatCompletions(body, provider);
   chatReq.model = resolveCompactModel(cfg);
   chatReq.stream = false;
   delete chatReq.tools; // prose summary, never a tool call
@@ -1806,7 +1945,7 @@ async function handleResponsesCompact(req, provider, body, res) {
     usage: translateUsage(cc.usage || {}),
     previous_response_id: null,
   };
-  storeResponse(respId, {
+  await storeResponse(respId, {
     provider,
     input: normalizeInputToArray(body.input),
     output: compactOutput.output,
@@ -2085,6 +2224,39 @@ const server = http.createServer(async (req, res) => {
 
       const originalInput = normalizeInputToArray(body.input);
 
+      // Debug aid (LOG_LEVEL=debug): dump the inbound context so you can verify
+      // whether the client sends full history each turn or relies on
+      // previous_response_id. Prints item count, prev id, store flag, and a short
+      // per-item preview; also writes the FULL raw body to a per-request JSON file
+      // under DEBUG_BODY_DIR (default /tmp) for inspection. Inert unless debug.
+      if (LOG_LEVEL >= LOG_LEVELS.debug) {
+        const previewItem = (it) => {
+          const role = it.role ? `:${it.role}` : "";
+          const textOf = (c) => Array.isArray(c)
+            ? c.map((p) => p.text ?? p.input_text ?? p.output_text ?? "").join("")
+            : (typeof c === "string" ? c : "");
+          let detail = "";
+          if (it.type === "function_call") detail = `${it.name || "?"}(${it.call_id || "?"})`;
+          else if (it.type === "function_call_output") detail = `(${it.call_id || "?"})`;
+          else detail = textOf(it.content).replace(/\s+/g, " ").slice(0, 80);
+          return `${it.type || "?"}${role}${detail ? " " + JSON.stringify(detail) : ""}`;
+        };
+        const seq = String(++DEBUG_REQ_SEQ).padStart(3, "0");
+        let bodyFile = "";
+        try {
+          const dir = process.env.DEBUG_BODY_DIR || "/tmp";
+          const safeModel = String(body.model || "none").replace(/[^a-zA-Z0-9._-]/g, "_");
+          bodyFile = `${dir}/cb-req-${seq}-${safeModel}.json`;
+          fs.writeFileSync(bodyFile, JSON.stringify(body, null, 2));
+        } catch (e) {
+          bodyFile = `(write failed: ${e.message})`;
+        }
+        log.debug(
+          `[debug] #${seq} /v1/responses inbound | model=${body.model || "<none>"} | prev_id=${body.previous_response_id || "<none>"} | store=${body.store} | input_items=${originalInput.length} | tools=${Array.isArray(body.tools) ? body.tools.length : 0} | body=${bodyFile}`
+        );
+        originalInput.forEach((it, i) => log.debug(`[debug]   [${i}] ${previewItem(it)}`));
+      }
+
       // Health-check / probe short-circuit: cc-switch (and similar managers) ping the
       // proxy with empty or input-less bodies just to verify reachability. Forwarding
       // those upstream produces a 400 ("Empty input messages") which surfaces in the UI
@@ -2126,6 +2298,43 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Block Codex Desktop's background suggestions agent before it reaches any
+      // upstream. We answer locally with an empty-but-schema-valid result
+      // (`{"suggestions":[]}`), so the Desktop UI simply shows no suggestions
+      // instead of erroring — and the user's repo context never leaves the box.
+      if (BLOCK_CODEX_SUGGESTIONS && isCodexSuggestionsRequest(body)) {
+        log.info(`[proxy] BLOCKED Codex suggestions request (model=${body.model || "<none>"}, input_items=${originalInput.length}) — returned empty, upstream untouched`);
+        const blockedResp = {
+          id: `resp_blocked_${Math.random().toString(36).slice(2, 12)}`,
+          object: "response",
+          created_at: Math.floor(Date.now() / 1000),
+          status: "completed",
+          model: body.model || (OAI_COMPAT_PROVIDERS[provider]?.defaultModel) || "blocked",
+          output: [
+            {
+              type: "message",
+              id: `msg_blocked_${Math.random().toString(36).slice(2, 10)}`,
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: '{"suggestions":[]}', annotations: [] }],
+            },
+          ],
+          previous_response_id: null,
+          metadata: { blocked: "codex_suggestions" },
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens_details: { reasoning_tokens: 0 },
+          },
+          incomplete_details: null,
+        };
+        if (body.stream) await sendResponseAsStream(res, blockedResp, req);
+        else sendJson(res, 200, blockedResp);
+        return;
+      }
+
       if (isCompactPath) {
         await handleResponsesCompact(req, provider, body, res);
         return;
@@ -2137,7 +2346,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const originalPreviousResponseId = body.previous_response_id || null;
-        maybeResolvePreviousResponseChain(body, "openai");
+        await maybeResolvePreviousResponseChain(body, "openai");
         log.info(`[proxy] responses openai(${body.model || OPENAI_MODELS[0] || "default"}) | stream=${!!body.stream}`);
         await forwardOpenAIResponses(req, body, res, originalInput, originalPreviousResponseId);
         return;
@@ -2212,6 +2421,64 @@ server.keepAliveTimeout = 300000;
 server.headersTimeout = 300000;
 server.requestTimeout = 0;
 
+// Swap the default MemoryStore for a RedisStore when REDIS_URL is set. The
+// `redis` package is an optionalDependency, loaded lazily here so the default
+// (in-memory) path never needs `npm install`. A connection failure is fatal —
+// if the operator asked for Redis, silently falling back to memory would hide a
+// misconfiguration and quietly break cross-replica session continuity.
+async function initStore() {
+  if (!REDIS_URL) return "in-memory";
+  let createClient;
+  try {
+    ({ createClient } = await import("redis"));
+  } catch {
+    console.error(
+      "[codex-bridge] REDIS_URL is set but the 'redis' package is not installed.\n" +
+      "                Run `npm install redis`, or unset REDIS_URL to use the in-memory store."
+    );
+    process.exit(1);
+  }
+  const client = createClient({ url: REDIS_URL });
+  client.on("error", (err) => log.error("[codex-bridge] redis error:", err?.message || err));
+  await client.connect();
+  store = new RedisStore(client);
+  return "redis";
+}
+
+// Redact credentials from a redis URL for logging (redis://user:pass@host:port).
+function redactRedisUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = "***";
+    return u.toString();
+  } catch {
+    return "redis://(unparseable url)";
+  }
+}
+
+let shuttingDown = false;
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[codex-bridge] ${sig} received — shutting down gracefully…`);
+  // Stop accepting new connections, drain in-flight ones, then close the store.
+  const forceTimer = setTimeout(() => {
+    console.error("[codex-bridge] graceful shutdown timed out — forcing exit");
+    process.exit(1);
+  }, 10000);
+  forceTimer.unref();
+  server.close(async () => {
+    try { await store.close(); } catch { /* best effort */ }
+    clearTimeout(forceTimer);
+    console.log("[codex-bridge] shutdown complete");
+    process.exit(0);
+  });
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+const storeKind = await initStore();
+
 server.listen(PORT, () => {
   console.log(`[codex-bridge] Listening on http://localhost:${PORT}`);
   console.log(`[codex-bridge] Default provider: ${getFallbackProvider()}`);
@@ -2221,6 +2488,7 @@ server.listen(PORT, () => {
   }
   console.log(`[codex-bridge] OpenAI  : ${OPENAI_KEY ? `${OPENAI_BASE} | models=${OPENAI_MODELS.join(", ")}` : "DISABLED"}`);
   console.log(`[codex-bridge] GitHub  : ${process.env.GITHUB_TOKEN ? "authenticated (env)" : "lazy (will run `gh auth token` on first api.github.com fetch)"}`);
+  console.log(`[codex-bridge] Store   : ${storeKind === "redis" ? `redis (${redactRedisUrl(REDIS_URL)}, TTL=${Math.round(STORE_TTL / 1000)}s)` : `in-memory (LRU, max=${STORE_MAX}, TTL=${Math.round(STORE_TTL / 1000)}s)`}`);
   if (!PROXY_AUTH_ENABLED) {
     console.log(`[codex-bridge] Inbound : OPEN — anyone on localhost can use this proxy (set PROXY_AUTH_KEY or PROXY_KEYS to lock down)`);
   } else {

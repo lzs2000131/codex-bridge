@@ -32,10 +32,11 @@ codex-bridge translates between them in both directions — streaming SSE, tool 
 - **Per-provider reasoning effort translation** — Codex's `none | minimal | low | medium | high | xhigh` mapped to each upstream's native format
 - **Thinking-mode tool-call round-trip** — caches `reasoning_content` and replays it so DeepSeek's thinking mode survives multi-turn tool calls
 - **Inbound auth gate** — `PROXY_AUTH_KEY` / `PROXY_KEYS` with optional per-key provider locking
-- **Session continuity** — `previous_response_id` works across providers (LRU-bounded store)
+- **Session continuity** — `previous_response_id` works across providers (in-memory LRU, or Redis for persistence/scale)
 - **Built-in `web_fetch` tool** — bypasses sandbox restrictions for URL-heavy conversations
 - **Tool-call circuit breaker** — soft warning + hard tool stripping on runaway tool loops
-- **Single-file, zero dependencies** — one `proxy.mjs` (~2000 lines), no `npm install`
+- **Single-file, zero dependencies** — one `proxy.mjs` (~2000 lines), no `npm install` (Redis backend is opt-in)
+- **Docker-ready** — `Dockerfile` + `docker-compose.yml` (bridge + Redis), non-root, healthcheck, graceful shutdown
 
 ## Quick Start
 
@@ -87,6 +88,57 @@ Set the auth key for Codex:
 > **Using [CC Switch](https://github.com/farion1231/cc-switch)?** Skip the manual edit — add a provider in the GUI instead. See [Using with CC Switch](#using-with-cc-switch).
 
 Run `codex` — done.
+
+## Docker & Redis
+
+The bare `node proxy.mjs` keeps session history (`previous_response_id`) in an
+in-process LRU Map — perfect for local single-instance use, but lost on restart
+and not shared across replicas. For a persistent, horizontally-scalable
+deployment, run the bundled stack, which pairs the bridge with Redis.
+
+```bash
+cp env.example .env          # fill in your provider + proxy keys
+docker compose up -d         # starts bridge (:4000) + redis
+docker compose logs -f bridge
+```
+
+The bridge auto-detects Redis via `REDIS_URL` (compose injects
+`redis://redis:6379`). On startup it prints which backend is active:
+
+```
+[codex-bridge] Store   : redis (redis://redis:6379, TTL=3600s)
+```
+
+**Horizontal scaling** — because all session state lives in Redis, you can run
+multiple replicas behind a load balancer; any replica can continue any session:
+
+```bash
+docker compose up -d --scale bridge=3   # front these with your own LB
+```
+
+**Standalone image** (bring your own Redis, or run in-memory by omitting `REDIS_URL`):
+
+```bash
+npm run docker:build                                   # -> codex-bridge:latest
+docker run --rm -p 4000:4000 --env-file .env \
+  -e REDIS_URL=redis://your-redis:6379 codex-bridge:latest
+```
+
+**Publishing** — `scripts/docker-publish.sh` builds and pushes version + `latest`
+tags (version read from `package.json`):
+
+```bash
+REGISTRY=ghcr.io/you IMAGE=codex-bridge ./scripts/docker-publish.sh
+PLATFORMS=linux/amd64,linux/arm64 REGISTRY=ghcr.io/you ./scripts/docker-publish.sh  # multi-arch
+./scripts/docker-publish.sh --dry-run                                               # preview only
+```
+
+The image runs as a non-root user, ships a `/health` `HEALTHCHECK`, and the proxy
+handles `SIGTERM`/`SIGINT` for graceful shutdown (drains connections, closes Redis).
+
+> To use Redis without Docker: `npm install redis` then set `REDIS_URL` before
+> `npm start`. Without `REDIS_URL`, the `redis` package is never imported and the
+> zero-dependency in-memory path is used.
 
 ## Architecture
 
@@ -259,11 +311,30 @@ cc-switch use codex-bridge
 | Upstream timeout | Slow provider response | Increase `UPSTREAM_TIMEOUT_MS` in `.env` (default 120 000 ms) |
 | Model not found | Model not in any `*_MODELS` list | Add it to `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`, or use `MODEL_CATALOG_PATH` |
 
+## Production Roadmap
+
+Shipped for production use:
+
+- ✅ **Redis-backed shared store** — persistent, cross-replica session continuity (`REDIS_URL`)
+- ✅ **Horizontal scaling** — stateless replicas behind a load balancer
+- ✅ **Containerization** — `Dockerfile` + `docker-compose.yml`, non-root user, `/health` healthcheck
+- ✅ **Graceful shutdown** — `SIGTERM`/`SIGINT` drains in-flight requests and closes Redis
+
+Not yet implemented (contributions welcome):
+
+- ⬜ **Automated tests** — unit/integration coverage beyond `scripts/smoke.sh`
+- ⬜ **CI/CD** — GitHub Actions for lint/test/build/publish
+- ⬜ **Metrics** — Prometheus `/metrics` (request counts, latencies, upstream errors, store hit rate)
+- ⬜ **Rate limiting** — per-key request/concurrency caps to protect upstreams
+- ⬜ **Key rotation** — hot-reload of `PROXY_KEYS` without restart
+- ⬜ **Structured logging** — JSON logs with request-id propagation for tracing
+
 ## Requirements
 
 - Node.js 18+
 - macOS / Linux / Windows
 - At least one upstream API key (DeepSeek, MiMo, or OpenAI)
+- Optional: Redis 6+ and the `redis` npm package (for the shared store backend)
 
 ## License
 

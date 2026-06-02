@@ -1,0 +1,50 @@
+# codex-bridge + Redis — single-command dev/prod stack.
+#
+#   cp env.example .env   # fill in keys
+#   docker compose up -d
+#
+# The bridge talks to the bundled Redis for persistent, shared session storage
+# (previous_response_id continuity survives restarts and works across replicas).
+# Scale horizontally with:  docker compose up -d --scale bridge=3  (front with a
+# load balancer; all replicas share the same Redis).
+
+services:
+  bridge:
+    build: .
+    image: ${BRIDGE_IMAGE:-codex-bridge:latest}
+    restart: unless-stopped
+    # Secrets / provider keys come from .env; values below override anything in
+    # .env that would conflict with the containerised setup.
+    env_file:
+      - .env
+    environment:
+      PROXY_PORT: "4000"
+      REDIS_URL: "redis://redis:6379"
+    ports:
+      - "${BRIDGE_PORT:-4000}:4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly = durable across restarts; tune maxmemory policy to evict
+    # least-recently-used session keys under pressure rather than OOM.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

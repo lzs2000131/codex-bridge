@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env proxy.mjs",
-    "smoke": "./scripts/smoke.sh"
+    "smoke": "./scripts/smoke.sh",
+    "docker:build": "docker build -t codex-bridge:latest .",
+    "docker:publish": "./scripts/docker-publish.sh"
   },
   "keywords": [
     "codex",
@@ -19,5 +21,8 @@
     "responses-api",
     "chat-completions"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "optionalDependencies": {
+    "redis": "^4.7.0"
+  }
 }
