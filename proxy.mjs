@@ -1791,11 +1791,32 @@ async function handleResponsesCompact(req, provider, body, res) {
   if (typeof text !== "string") text = "";
   text = text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim(); // mirror chatCompletionToResponse
 
-  // Single JSON object, no SSE. `output` items must be ResponseItem-shaped;
-  // a plain assistant message is kept by codex's should_keep_compacted_history_item.
-  sendJson(res, 200, {
+  // Build a full Responses-API-shaped response so sub2api passthrough and Codex
+  // compact consumer both see expected fields. Minimal {output:[...]} works when
+  // Codex speaks directly to the proxy, but the sub2api pass-through (model
+  // remapping, usage extraction, etc.) may need id / model / usage present.
+  const respId = `resp_compact_${uid()}`;
+  const compactOutput = {
+    id: respId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: body.model, // original model the client asked for (e.g. gpt-5.5)
     output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+    usage: translateUsage(cc.usage || {}),
+    previous_response_id: null,
+  };
+  storeResponse(respId, {
+    provider,
+    input: normalizeInputToArray(body.input),
+    output: compactOutput.output,
+    previousResponseId: null,
+    reasoningContent: "",
   });
+  const ts = Date.now();
+  try { fs.writeFileSync(`/tmp/compact-resp-${ts}.json`, JSON.stringify(compactOutput, null, 2)); } catch {}
+  log.info(`[proxy] compact DONE ${text.length}chars summary → /tmp/compact-resp-${ts}.json model=${body.model} usage=${JSON.stringify(compactOutput.usage)}`);
+  sendJson(res, 200, compactOutput);
 }
 
 async function handleOaiCompatChatCompletions(req, provider, body, res) {
