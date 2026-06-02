@@ -100,7 +100,7 @@ const MIMO_MODELS = parseCsv(process.env.MIMO_MODELS || "mimo-v2.5-pro");
 // model called silently through the view_image tool. Defaults to the MiMo
 // provider (mimo-v2.5); override with VISION_* to point elsewhere. Enabled iff a
 // key resolves — otherwise images are stripped to a placeholder (no upstream 400).
-const VISION_MODEL = (process.env.VISION_MODEL || "mimo-v2.5-pro").trim();
+const VISION_MODEL = (process.env.VISION_MODEL || "mimo-v2.5").trim();
 const VISION_BASE = (process.env.VISION_BASE_URL || MIMO_BASE).replace(/\/+$/, "");
 const VISION_KEY = (process.env.VISION_API_KEY || MIMO_KEY || "").trim();
 const VISION_ENABLED = !!VISION_KEY;
@@ -404,8 +404,14 @@ async function executeViewImage(argsStr) {
     const id = (args.image_id || args.id || "").toString().trim();
     const query = (args.query || args.prompt || "Describe this image in detail, including any text (OCR), UI elements, diagrams and data.").toString();
     const url = id && imageStore.get(id);
-    if (!url) return `Error: image "${id || "(none)"}" not found. Use the exact id from the [[image:img_...]] marker.`;
+    if (!url) {
+      log.warn(`[proxy] view_image: id="${id}" not in store (known: ${[...imageStore.keys()].join(", ") || "(empty)"})`);
+      return `Error: image "${id || "(none)"}" not found. Use the exact id from the [[image:img_...]] marker.`;
+    }
     if (!VISION_ENABLED) return "Error: no vision model is configured (set VISION_API_KEY / MIMO_API_KEY).";
+    const isDataUrl = url.startsWith("data:");
+    const urlLen = url.length;
+    log.info(`[proxy] view_image ${id} | model=${VISION_MODEL} | base=${VISION_BASE} | query="${query.slice(0, 80)}" | url=${isDataUrl ? `data:${urlLen}chars` : url.slice(0, 80)}`);
     const res = await fetchWithTimeout(`${VISION_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${VISION_KEY}` },
@@ -421,14 +427,17 @@ async function executeViewImage(argsStr) {
     }, UPSTREAM_TIMEOUT);
     if (!res.ok) {
       const t = await res.text().catch(() => "");
+      log.warn(`[proxy] view_image ${id} UPSTREAM ERROR ${res.status}: ${t.slice(0, 400)}`);
       return `Vision model error ${res.status}: ${t.slice(0, 300)}`;
     }
     const j = await res.json();
     let out = j.choices?.[0]?.message?.content;
     if (typeof out !== "string") out = out ? JSON.stringify(out) : "";
     out = out.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+    log.info(`[proxy] view_image ${id} OK -> ${out.length} chars`);
     return out || "(vision model returned no content)";
   } catch (err) {
+    log.warn(`[proxy] view_image exception: ${err.message}`);
     if (err.name === "AbortError") return "Vision error: request timed out";
     return `Vision error: ${err.message}`;
   }
