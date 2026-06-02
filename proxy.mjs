@@ -96,6 +96,16 @@ const MIMO_BASE = process.env.MIMO_BASE_URL || "https://token-plan-cn.xiaomimimo
 const MIMO_KEY = process.env.MIMO_API_KEY || "";
 const MIMO_MODELS = parseCsv(process.env.MIMO_MODELS || "mimo-v2.5-pro");
 
+// --- Vision: parse images the (text-only) main model can't see, via a vision
+// model called silently through the view_image tool. Defaults to the MiMo
+// provider (mimo-v2.5); override with VISION_* to point elsewhere. Enabled iff a
+// key resolves — otherwise images are stripped to a placeholder (no upstream 400).
+const VISION_MODEL = (process.env.VISION_MODEL || "mimo-v2.5-pro").trim();
+const VISION_BASE = (process.env.VISION_BASE_URL || MIMO_BASE).replace(/\/+$/, "");
+const VISION_KEY = (process.env.VISION_API_KEY || MIMO_KEY || "").trim();
+const VISION_ENABLED = !!VISION_KEY;
+const VISION_MAX_TOKENS = Number(process.env.VISION_MAX_TOKENS) || 2048;
+
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 // Default empty — OpenAI is opt-in, set OPENAI_MODELS or OPENAI_API_KEY explicitly to enable.
@@ -341,6 +351,104 @@ async function executeWebFetch(argsStr) {
     if (err.name === "AbortError") return "Fetch error: request timed out";
     return `Fetch error: ${err.message}`;
   }
+}
+
+// --- Vision / image handling ---------------------------------------------
+//
+// Text-only upstreams (DeepSeek) 400 on image_url content. We strip every image
+// out of what the main model sees, stash it under a content-hashed id, and leave
+// a `[[image:img_xxxx]]` placeholder. When vision is configured, we also offer a
+// `view_image` tool the main model can call (with its own query) to have the
+// image analysed by a vision model (mimo-v2.5) — silently, like web_fetch.
+const IMAGE_PLACEHOLDER_MARK = "[[image:";
+const imageStore = new Map(); // id -> data/remote url
+const IMAGE_STORE_MAX = Number(process.env.IMAGE_STORE_MAX) || 200;
+
+function stashImage(url) {
+  const id = "img_" + crypto.createHash("sha1").update(url).digest("hex").slice(0, 10);
+  if (!imageStore.has(id)) {
+    if (imageStore.size >= IMAGE_STORE_MAX) imageStore.delete(imageStore.keys().next().value);
+    imageStore.set(id, url);
+  } else {
+    // refresh LRU position
+    const v = imageStore.get(id); imageStore.delete(id); imageStore.set(id, v);
+  }
+  return id;
+}
+
+function imagePlaceholder(id) {
+  return VISION_ENABLED
+    ? `${IMAGE_PLACEHOLDER_MARK}${id}]] An image is attached here. You cannot see it directly — call view_image({"image_id":"${id}","query":"<exactly what you need: OCR text, UI layout, chart values, etc.>"}) to read it. You may call it multiple times with different queries.`
+    : `${IMAGE_PLACEHOLDER_MARK}${id}]] (an image was attached here but this model cannot read images)`;
+}
+
+const VIEW_IMAGE_TOOL = {
+  type: "function",
+  function: {
+    name: "view_image",
+    description: "Analyze an image attached to the conversation that you cannot see directly. Pass the image_id from its [[image:img_...]] marker and a query describing exactly what to extract (OCR text, UI layout, diagram, chart values, etc.). Returns the vision model's analysis. Call it as many times as you need with different queries.",
+    parameters: {
+      type: "object",
+      properties: {
+        image_id: { type: "string", description: "The image id from its [[image:img_...]] marker, e.g. img_1a2b3c4d5e." },
+        query: { type: "string", description: "What to extract / how detailed the analysis should be." },
+      },
+      required: ["image_id", "query"],
+    },
+  },
+};
+
+async function executeViewImage(argsStr) {
+  try {
+    const args = typeof argsStr === "string" ? JSON.parse(argsStr) : argsStr;
+    const id = (args.image_id || args.id || "").toString().trim();
+    const query = (args.query || args.prompt || "Describe this image in detail, including any text (OCR), UI elements, diagrams and data.").toString();
+    const url = id && imageStore.get(id);
+    if (!url) return `Error: image "${id || "(none)"}" not found. Use the exact id from the [[image:img_...]] marker.`;
+    if (!VISION_ENABLED) return "Error: no vision model is configured (set VISION_API_KEY / MIMO_API_KEY).";
+    const res = await fetchWithTimeout(`${VISION_BASE}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${VISION_KEY}` },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        messages: [{ role: "user", content: [
+          { type: "text", text: query },
+          { type: "image_url", image_url: { url } },
+        ] }],
+        stream: false,
+        max_tokens: VISION_MAX_TOKENS,
+      }),
+    }, UPSTREAM_TIMEOUT);
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      return `Vision model error ${res.status}: ${t.slice(0, 300)}`;
+    }
+    const j = await res.json();
+    let out = j.choices?.[0]?.message?.content;
+    if (typeof out !== "string") out = out ? JSON.stringify(out) : "";
+    out = out.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+    return out || "(vision model returned no content)";
+  } catch (err) {
+    if (err.name === "AbortError") return "Vision error: request timed out";
+    return `Vision error: ${err.message}`;
+  }
+}
+
+function conversationHasImageRefs(messages) {
+  const hit = (text) => typeof text === "string" && text.includes(IMAGE_PLACEHOLDER_MARK);
+  return messages.some((m) => {
+    const c = m?.content;
+    if (hit(c)) return true;
+    if (Array.isArray(c)) return c.some((p) => hit(p?.text));
+    return false;
+  });
+}
+
+function ensureViewImageTool(tools) {
+  const list = Array.isArray(tools) ? [...tools] : [];
+  const present = list.some((t) => t?.function?.name === "view_image" || t?.name === "view_image");
+  if (!present) list.push(VIEW_IMAGE_TOOL);
+  return list;
 }
 
 function parseCsv(value) {
@@ -866,7 +974,12 @@ async function responsesRequestToChatCompletions(body, provider) {
             if (block.type === "input_text") return { type: "text", text: block.text };
             if (block.type === "output_text") return { type: "text", text: block.text };
             if (block.type === "input_image") {
-              return { type: "image_url", image_url: { url: block.image_url || block.url } };
+              // DeepSeek/MiMo text models 400 on image_url. Stash the image and
+              // replace it with a placeholder; the view_image tool (if vision is
+              // configured) lets the model read it on demand.
+              const imgUrl = block.image_url || block.url;
+              if (!imgUrl) return { type: "text", text: "[image: missing url]" };
+              return { type: "text", text: imagePlaceholder(stashImage(imgUrl)) };
             }
             return block;
           });
@@ -1667,22 +1780,23 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
     const ccResponse = await upstreamRes.json();
     const msg = ccResponse.choices?.[0]?.message;
-    const webFetchCalls = (msg?.tool_calls || []).filter((tc) => tc.function?.name === "web_fetch");
-    const currentFetchUrls = webFetchCalls.map((tc) => {
-      try { return JSON.parse(tc.function.arguments).url; }
-      catch { return ""; }
-    }).sort().join("|");
-    const isStuckLoop = webFetchCalls.length > 0 && currentFetchUrls === prevFetchUrls;
+    // Proxy-handled tools the model may call: web_fetch and view_image. Both are
+    // executed server-side and fed back silently (the client never sees them).
+    const isProxyTool = (tc) => tc.function?.name === "web_fetch" || tc.function?.name === "view_image";
+    const proxyToolCalls = (msg?.tool_calls || []).filter(isProxyTool);
+    const callKey = (tc) => `${tc.function?.name}:${tc.function?.arguments || ""}`;
+    const currentKeys = proxyToolCalls.map(callKey).sort().join("|");
+    const isStuckLoop = proxyToolCalls.length > 0 && currentKeys === prevFetchUrls;
 
-    if (webFetchCalls.length === 0 || loop === MAX_FETCH_LOOPS || isStuckLoop) {
+    if (proxyToolCalls.length === 0 || loop === MAX_FETCH_LOOPS || isStuckLoop) {
       if (isStuckLoop) {
-        log.warn(`[proxy] ${tag}web_fetch loop stuck — model re-requested same URL(s), breaking early at loop ${loop + 1}`);
+        log.warn(`[proxy] ${tag}tool loop stuck — model re-requested the same call(s), breaking early at loop ${loop + 1}`);
       }
-      if (loop === MAX_FETCH_LOOPS && webFetchCalls.length > 0) {
-        log.warn(`[proxy] ${tag}web_fetch MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — stripping remaining fetches`);
+      if (loop === MAX_FETCH_LOOPS && proxyToolCalls.length > 0) {
+        log.warn(`[proxy] ${tag}MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — stripping remaining proxy tool calls`);
       }
       if (msg?.tool_calls) {
-        msg.tool_calls = msg.tool_calls.filter((tc) => tc.function?.name !== "web_fetch");
+        msg.tool_calls = msg.tool_calls.filter((tc) => !isProxyTool(tc));
         if (msg.tool_calls.length === 0) {
           delete msg.tool_calls;
           if (ccResponse.choices[0].finish_reason === "tool_calls") {
@@ -1695,26 +1809,25 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
       break;
     }
 
-    prevFetchUrls = currentFetchUrls;
-    log.info(`[proxy] ${tag}executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
-    const results = await Promise.all(webFetchCalls.map(async (tc) => {
-      const fetchUrl = (() => {
-        try { return JSON.parse(tc.function.arguments).url; }
-        catch { return "unknown"; }
-      })();
-      if (fetchCache.has(fetchUrl)) {
-        log.info(`[proxy] ${tag}web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
-        return { role: "tool", tool_call_id: tc.id, content: fetchCache.get(fetchUrl) };
+    prevFetchUrls = currentKeys;
+    log.info(`[proxy] ${tag}executing ${proxyToolCalls.length} proxy tool call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
+    const results = await Promise.all(proxyToolCalls.map(async (tc) => {
+      const name = tc.function?.name;
+      const key = callKey(tc);
+      if (fetchCache.has(key)) {
+        return { role: "tool", tool_call_id: tc.id, content: fetchCache.get(key) };
       }
-      const content = await executeWebFetch(tc.function.arguments);
-      fetchCache.set(fetchUrl, content);
-      log.info(`[proxy] ${tag}web_fetch ${fetchUrl} -> ${content.length} chars`);
+      const content = name === "view_image"
+        ? await executeViewImage(tc.function.arguments)
+        : await executeWebFetch(tc.function.arguments);
+      fetchCache.set(key, content);
+      log.info(`[proxy] ${tag}${name} -> ${content.length} chars`);
       return { role: "tool", tool_call_id: tc.id, content };
     }));
 
     loopMessages = [
       ...loopMessages,
-      { role: "assistant", content: null, tool_calls: webFetchCalls },
+      { role: "assistant", content: null, tool_calls: proxyToolCalls },
       ...results,
     ];
   }
@@ -1786,12 +1899,17 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     chatReq.tools = ensureWebFetchTool(chatReq.tools);
     chatReq.messages = ensureWebFetchHint(chatReq.messages);
   }
+  const hasImages = VISION_ENABLED && conversationHasImageRefs(chatReq.messages);
+  if (hasImages) {
+    chatReq.tools = ensureViewImageTool(chatReq.tools);
+  }
+  const needsToolLoop = hasConversationUrls || hasImages;
 
   log.info(
-    `[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasConversationUrls ? " | web_fetch_injected" : ""} | roles=[${chatReq.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`
+    `[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasConversationUrls ? " | web_fetch_injected" : ""}${hasImages ? " | view_image_injected" : ""} | roles=[${chatReq.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`
   );
 
-  if (hasConversationUrls) {
+  if (needsToolLoop) {
     const result = await runWebFetchLoop({
       baseRequest: chatReq,
       initialMessages: chatReq.messages,
@@ -1952,9 +2070,7 @@ async function handleResponsesCompact(req, provider, body, res) {
     previousResponseId: null,
     reasoningContent: "",
   });
-  const ts = Date.now();
-  try { fs.writeFileSync(`/tmp/compact-resp-${ts}.json`, JSON.stringify(compactOutput, null, 2)); } catch {}
-  log.info(`[proxy] compact DONE ${text.length}chars summary → /tmp/compact-resp-${ts}.json model=${body.model} usage=${JSON.stringify(compactOutput.usage)}`);
+  log.info(`[proxy] compact DONE ${text.length}-char summary (model=${chatReq.model})`);
   sendJson(res, 200, compactOutput);
 }
 
@@ -1991,10 +2107,15 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
     body.tools = ensureWebFetchTool(body.tools);
     body.messages = ensureWebFetchHint(body.messages);
   }
+  const ccHasImages = VISION_ENABLED && conversationHasImageRefs(body.messages);
+  if (ccHasImages) {
+    body.tools = ensureViewImageTool(body.tools);
+  }
+  const ccNeedsLoop = ccHasUrls || ccHasImages;
 
-  log.info(`[proxy] chat/completions ${provider}(${body.model}) | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""} | roles=[${body.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
+  log.info(`[proxy] chat/completions ${provider}(${body.model}) | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""}${ccHasImages ? " | view_image_injected" : ""} | roles=[${body.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
 
-  if (ccHasUrls) {
+  if (ccNeedsLoop) {
     const result = await runWebFetchLoop({
       baseRequest: body,
       initialMessages: body.messages,
