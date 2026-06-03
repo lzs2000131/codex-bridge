@@ -382,6 +382,47 @@ function imagePlaceholder(id) {
     : `${IMAGE_PLACEHOLDER_MARK}${id}]] (an image was attached here but this model cannot read images)`;
 }
 
+// Pull a usable URL string out of any image content-block shape we might see:
+//   Responses:        { type:"input_image", image_url:"data:..." | {url} }
+//   Chat Completions: { type:"image_url",   image_url:{url} | "..." }
+//   Anthropic-ish:    { type:"image",       source:{url|data} }
+function extractImageUrl(block) {
+  const iu = block.image_url ?? block.url ?? block.source;
+  if (!iu) return null;
+  if (typeof iu === "string") return iu;
+  if (typeof iu === "object") return iu.url || iu.data || null;
+  return null;
+}
+
+function isImageBlock(block) {
+  const t = block?.type;
+  return t === "input_image" || t === "image_url" || t === "image";
+}
+
+// Convert a single Responses/Anthropic-style content block into a Chat Completions
+// part. Images are stashed and replaced with a [[image:...]] placeholder so
+// text-only upstreams don't 400 on an unknown `input_image`/`image_url` variant;
+// the silent view_image tool reads the real bytes on demand.
+function contentBlockToChat(block) {
+  if (block == null || typeof block !== "object") return block;
+  if (block.type === "input_text" || block.type === "output_text") return { type: "text", text: block.text ?? "" };
+  if (isImageBlock(block)) {
+    const url = extractImageUrl(block);
+    if (!url) return { type: "text", text: "[image: missing url]" };
+    return { type: "text", text: imagePlaceholder(stashImage(url)) };
+  }
+  return block;
+}
+
+// Normalize a content value (string | block array) into Chat-compatible content.
+// A lone text part collapses back to a plain string (what most upstreams expect).
+function contentToChat(content) {
+  if (!Array.isArray(content)) return content;
+  const parts = content.map(contentBlockToChat);
+  if (parts.length === 1 && parts[0]?.type === "text") return parts[0].text;
+  return parts;
+}
+
 const VIEW_IMAGE_TOOL = {
   type: "function",
   function: {
@@ -776,6 +817,24 @@ function isCodexSuggestionsRequest(body) {
 //   5. Coerce tool_call.arguments / tool.content to strings (only used by the CC path)
 // They used to maintain two separate copies. This is the single source of truth.
 function normalizeMessages(messages, { coerceStrings = false } = {}) {
+  // Pass 0: normalize content blocks across EVERY path. Responses-style
+  // `input_text`/`input_image`, Chat `image_url`, and Anthropic `image` blocks are
+  // mapped to Chat-compatible parts, with images stashed and swapped for
+  // [[image:...]] placeholders. This is the single choke point that stops unknown
+  // `input_image` variants from leaking to text-only upstreams — including images
+  // carried inside tool results (function_call_output), which the per-message
+  // conversion in responsesRequestToChatCompletions never touched.
+  for (const msg of messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const collapsed = contentToChat(msg.content);
+    // Tool messages must be a plain string for most upstreams; flatten any parts.
+    if (msg.role === "tool" && Array.isArray(collapsed)) {
+      msg.content = collapsed.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("");
+    } else {
+      msg.content = collapsed;
+    }
+  }
+
   // Pass 1: re-order tool replies adjacent to their tool_calls.
   const work = [...messages];
   const fixed = [];
